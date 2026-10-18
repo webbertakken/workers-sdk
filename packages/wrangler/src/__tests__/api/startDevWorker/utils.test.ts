@@ -4,7 +4,10 @@ import {
 	convertStartDevOptionsToBindings,
 } from "../../../api/startDevWorker/binding-utils";
 import {
+	bodyReplayFor,
+	connectionRetryBudget,
 	isSameUserWorkerOrigin,
+	REPLAYABLE_BODY_MAX_BYTES,
 	rewriteUrlInHeaderValue,
 } from "../../../api/startDevWorker/utils";
 
@@ -371,5 +374,83 @@ describe("rewriteUrlInHeaderValue", () => {
 		expect(rewriteUrlInHeaderValue("http://127.0.0.1:8788/cb", to, from)).toBe(
 			"http://example.com/cb"
 		);
+	});
+});
+
+describe("bodyReplayFor", () => {
+	const post = (body: string | ReadableStream | null, length?: number) =>
+		new Request("http://localhost:8787/api", {
+			method: "POST",
+			body,
+			headers: length === undefined ? {} : { "Content-Length": String(length) },
+			// a ReadableStream body needs half-duplex in Node's Request
+			...(body instanceof ReadableStream ? { duplex: "half" } : {}),
+		});
+
+	it("needs no replay for a request without a body", ({ expect }) => {
+		expect(bodyReplayFor(new Request("http://localhost:8787/"))).toBe("none");
+		expect(bodyReplayFor(post(null))).toBe("none");
+	});
+
+	it("buffers a body whose declared length fits the limit", ({ expect }) => {
+		expect(bodyReplayFor(post("{}", 2))).toBe("buffered");
+		expect(
+			bodyReplayFor(
+				post("x".repeat(REPLAYABLE_BODY_MAX_BYTES), REPLAYABLE_BODY_MAX_BYTES)
+			)
+		).toBe("buffered");
+	});
+
+	it("streams a body over the limit or of unknown length", ({ expect }) => {
+		expect(bodyReplayFor(post("x", REPLAYABLE_BODY_MAX_BYTES + 1))).toBe(
+			"streamed"
+		);
+		expect(bodyReplayFor(post(new ReadableStream()))).toBe("streamed");
+	});
+});
+
+describe("connectionRetryBudget", () => {
+	const dropped = new TypeError("Network connection lost.");
+	const refused = new TypeError("fetch failed");
+
+	it("retries a bodyless GET, HEAD or OPTIONS twice after any connection failure", ({
+		expect,
+	}) => {
+		for (const method of ["GET", "HEAD", "OPTIONS"]) {
+			expect(
+				connectionRetryBudget({ method, bodyReplay: "none" }, dropped)
+			).toBe(2);
+			expect(
+				connectionRetryBudget({ method, bodyReplay: "none" }, refused)
+			).toBe(2);
+		}
+	});
+
+	it("resends any other request once, only after a dropped connection", ({
+		expect,
+	}) => {
+		expect(
+			connectionRetryBudget({ method: "POST", bodyReplay: "buffered" }, dropped)
+		).toBe(1);
+		expect(
+			connectionRetryBudget({ method: "DELETE", bodyReplay: "none" }, dropped)
+		).toBe(1);
+		expect(
+			connectionRetryBudget(
+				{ method: "OPTIONS", bodyReplay: "buffered" },
+				dropped
+			)
+		).toBe(1);
+		expect(
+			connectionRetryBudget({ method: "POST", bodyReplay: "buffered" }, refused)
+		).toBe(0);
+	});
+
+	it("never resends a streamed body, which cannot be read twice", ({
+		expect,
+	}) => {
+		expect(
+			connectionRetryBudget({ method: "PUT", bodyReplay: "streamed" }, dropped)
+		).toBe(0);
 	});
 });

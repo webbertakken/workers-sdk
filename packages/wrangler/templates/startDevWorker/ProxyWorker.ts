@@ -1,6 +1,10 @@
 import {
+	bodyReplayFor,
+	type BodyReplay,
+	connectionRetryBudget,
 	createDeferred,
 	type DeferredPromise,
+	isSafeToResend,
 	isSameUserWorkerOrigin,
 	rewriteUrlInHeaderValue,
 	urlFromParts,
@@ -44,6 +48,9 @@ export class ProxyWorker implements DurableObject {
 	proxyData?: ProxyData;
 	requestQueue = new Map<Request, DeferredPromise<Response>>();
 	requestRetryQueue = new Map<Request, DeferredPromise<Response>>();
+	// small bodies read on arrival, so a forward that meets a dropped
+	// connection can be rebuilt and sent again (see `connectionRetryBudget`)
+	bufferedBodies = new WeakMap<Request, ArrayBuffer>();
 
 	fetch(request: Request) {
 		if (isRequestForLiveReloadWebsocket(request)) {
@@ -59,6 +66,17 @@ export class ProxyWorker implements DurableObject {
 		}
 
 		// regular requests to be proxied
+		if (bodyReplayFor(request) === "buffered") {
+			return request.arrayBuffer().then((body) => {
+				this.bufferedBodies.set(request, body);
+				return this.enqueue(request);
+			});
+		}
+
+		return this.enqueue(request);
+	}
+
+	enqueue(request: Request) {
 		const deferred = createDeferred<Response>();
 
 		this.requestQueue.set(request, deferred);
@@ -111,6 +129,15 @@ export class ProxyWorker implements DurableObject {
 		yield* this.requestQueue;
 	}
 
+	/**
+	 * How `request`'s body reaches the UserWorker. Read from the buffer, not
+	 * from the request: a buffered request's own body stream is already used.
+	 */
+	bodyReplayOf(request: Request): BodyReplay {
+		if (this.bufferedBodies.has(request)) return "buffered";
+		return request.body === null ? "none" : "streamed";
+	}
+
 	processQueue() {
 		const { proxyData } = this; // store proxyData at the moment this function was called
 		if (proxyData === undefined) return;
@@ -118,6 +145,12 @@ export class ProxyWorker implements DurableObject {
 		for (const [request, deferredResponse] of this.getOrderedQueue()) {
 			this.requestRetryQueue.delete(request);
 			this.requestQueue.delete(request);
+
+			const bufferedBody = this.bufferedBodies.get(request);
+			const replay = {
+				method: request.method,
+				bodyReplay: this.bodyReplayOf(request),
+			};
 
 			const outerUrl = new URL(request.url);
 			const headers = new Headers(request.headers);
@@ -171,8 +204,10 @@ export class ProxyWorker implements DurableObject {
 			 * synchronously.
 			 *
 			 * A connection-level failure (the `fetch` itself rejects, so no
-			 * response was received) on a same-origin GET/HEAD request is retried
-			 * before being reported — see the rejection handler.
+			 * response was received) to the same UserWorker is retried before being
+			 * reported, as often as `connectionRetryBudget` allows: twice for a
+			 * bodyless GET/HEAD/OPTIONS, once for a request with a buffered or no
+			 * body after a dropped connection — see the rejection handler.
 			 *
 			 * Kept as a `const` arrow function: the handlers re-read
 			 * `this.proxyData` across async boundaries to detect UserWorker
@@ -182,7 +217,15 @@ export class ProxyWorker implements DurableObject {
 			 * (`0` on the first try)
 			 */
 			const attemptUserWorkerFetch = (attempt = 0) =>
-				void fetch(userWorkerUrl, new Request(request, { headers }))
+				void fetch(
+					userWorkerUrl,
+					new Request(
+						request,
+						bufferedBody === undefined
+							? { headers }
+							: { headers, body: bufferedBody }
+					)
+				)
 					.then(
 						async (res) => {
 							if (attempt > 0) {
@@ -221,17 +264,16 @@ export class ProxyWorker implements DurableObject {
 							// keep-alive connection at the same moment this request was
 							// written to it (kj's client pool idleTimeout and server
 							// pipelineTimeout both default to 5s, so a connection idling ~5s
-							// races the close). Retrying bodyless requests draws a fresh
-							// connection and absorbs the race, mirroring the requeue in the
-							// .catch for reloads: retry immediately, then once more after
-							// 250ms (3 attempts in total).
+							// races the close). Retrying draws a fresh connection and absorbs
+							// the race, mirroring the requeue in the .catch for reloads: retry
+							// immediately, then once more after 250ms, within the request's
+							// `connectionRetryBudget` (a buffered body is resent from memory).
 							if (
 								isSameUserWorkerOrigin(
 									userWorkerUrl,
 									this.proxyData?.userWorkerUrl
 								) &&
-								(request.method === "GET" || request.method === "HEAD") &&
-								attempt < 2
+								attempt < connectionRetryBudget(replay, error)
 							) {
 								setTimeout(
 									() => {
@@ -292,7 +334,7 @@ export class ProxyWorker implements DurableObject {
 						}
 
 						// if the request can be retried (subset of idempotent requests which have no body), requeue it
-						else if (request.method === "GET" || request.method === "HEAD") {
+						else if (isSafeToResend(replay)) {
 							this.requestRetryQueue.set(request, deferredResponse);
 							// we would only end up here if the downstream UserWorker is chang*ing*
 							// i.e. we are in a `pause`d state and expecting a `play` message soon
@@ -310,7 +352,7 @@ export class ProxyWorker implements DurableObject {
 						else {
 							deferredResponse.resolve(
 								new Response(
-									"Your worker restarted mid-request. Please try sending the request again. Only GET or HEAD requests are retried automatically.",
+									"Your worker restarted mid-request. Please try sending the request again. Only GET, HEAD and OPTIONS requests without a body are retried automatically.",
 									{
 										status: 503,
 										headers: { "Retry-After": "0" },

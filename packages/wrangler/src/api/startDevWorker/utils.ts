@@ -127,6 +127,102 @@ export function isSameUserWorkerOrigin(
 	return requestUrl.origin === currentUserWorkerUrl?.origin;
 }
 
+/**
+ * The largest request body, in bytes, that the ProxyWorker buffers on arrival
+ * so it can resend the request after a dropped connection to the UserWorker.
+ * Local dev bodies are mostly small JSON; uploads above this keep streaming.
+ */
+export const REPLAYABLE_BODY_MAX_BYTES = 1024 * 1024;
+
+/**
+ * How a proxied request's body can be sent to the UserWorker again:
+ * - `none`: there is no body, so the request can be rebuilt as is.
+ * - `buffered`: the body is read into memory on arrival and resent from there.
+ * - `streamed`: the body is forwarded as a stream, which can be read only once.
+ */
+export type BodyReplay = "none" | "buffered" | "streamed";
+
+/**
+ * Whether the ProxyWorker can resend `request`: a body is buffered only when it
+ * declares a `Content-Length` within {@link REPLAYABLE_BODY_MAX_BYTES}, so a
+ * body of unknown length (a chunked upload) is never held in memory.
+ */
+export function bodyReplayFor(
+	request: Pick<Request, "body" | "headers">
+): BodyReplay {
+	if (request.body === null) {
+		return "none";
+	}
+
+	const declaredLength = request.headers.get("Content-Length");
+	if (declaredLength === null) {
+		return "streamed";
+	}
+
+	const length = Number(declaredLength);
+	return Number.isInteger(length) &&
+		length >= 0 &&
+		length <= REPLAYABLE_BODY_MAX_BYTES
+		? "buffered"
+		: "streamed";
+}
+
+/**
+ * Whether a request is safe to send again whatever happened to the first
+ * attempt: a safe method (RFC 9110 §9.2.1) without a body, such as a CORS
+ * preflight. These are also the requests the ProxyWorker requeues across a
+ * UserWorker reload.
+ */
+export function isSafeToResend(request: {
+	method: string;
+	bodyReplay: BodyReplay;
+}): boolean {
+	return (
+		request.bodyReplay === "none" &&
+		(request.method === "GET" ||
+			request.method === "HEAD" ||
+			request.method === "OPTIONS")
+	);
+}
+
+/**
+ * Whether `error` is the UserWorker's connection closing under the request
+ * before any response arrived. In local dev this is almost always the
+ * keep-alive race: an idle connection closing just as the request is written
+ * to it, so the UserWorker never read the request.
+ */
+function isDroppedConnection(error: unknown): boolean {
+	return (
+		error instanceof Error && error.message.includes("Network connection lost")
+	);
+}
+
+/**
+ * How many times the ProxyWorker resends a request to the same UserWorker
+ * after the forward failed at the connection level (`fetch` rejected, so no
+ * response was received).
+ *
+ * - A request that is safe to resend is retried twice, after any failure.
+ * - Any other request whose body can be replayed is resent once, and only
+ *   after a dropped connection. The trade-off: if the UserWorker had in fact
+ *   started handling the first attempt, the handler runs twice. In `wrangler
+ *   dev` this is far rarer than the keep-alive race it absorbs, which otherwise
+ *   fails a POST that the UserWorker never saw.
+ * - A streamed body cannot be read twice, so it is never resent.
+ */
+export function connectionRetryBudget(
+	request: { method: string; bodyReplay: BodyReplay },
+	error: unknown
+): number {
+	if (isSafeToResend(request)) {
+		return 2;
+	}
+	if (request.bodyReplay === "streamed") {
+		return 0;
+	}
+	return isDroppedConnection(error) ? 1 : 0;
+}
+
 type UnwrapHook<
 	T extends HookValues | Promise<HookValues>,
 	Args extends unknown[],
