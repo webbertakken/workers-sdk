@@ -183,6 +183,34 @@ const aliasZodToMiniflareExtensionPlugin = {
 };
 
 /**
+ * `fast-xml-validator` re-exports a business-rules validator from
+ * `detailed-xml-validator`, which isn't marked side-effect free. Its top-level
+ * code only builds module-local parsers, so marking it lets esbuild drop it
+ * (and its bundled XML parser) from workers that only use `SyntaxValidator`.
+ * @type {esbuild.Plugin}
+ */
+const sideEffectFreeDetailedXmlValidatorPlugin = {
+	name: "side-effect-free-detailed-xml-validator",
+	setup(build) {
+		build.onResolve({ filter: /^detailed-xml-validator$/ }, async (args) => {
+			if (args.pluginData?.resolvingDetailedXmlValidator) {
+				return undefined;
+			}
+			const result = await build.resolve(args.path, {
+				kind: args.kind,
+				importer: args.importer,
+				resolveDir: args.resolveDir,
+				pluginData: { resolvingDetailedXmlValidator: true },
+			});
+			if (result.errors.length > 0) {
+				return { errors: result.errors };
+			}
+			return { path: result.path, sideEffects: false };
+		});
+	},
+};
+
+/**
  * Cache of esbuild build contexts for worker sub-builds. In watch mode,
  * these are reused across rebuilds for incremental compilation.
  * @type {Map<string, esbuild.BuildContext>}
@@ -260,6 +288,7 @@ const embedWorkersPlugin = {
 							? [rewriteNodeToInternalPlugin]
 							: []),
 						...(assetWorkerPaths.has(args.path) ? [noopSentryPlugin] : []),
+						sideEffectFreeDetailedXmlValidatorPlugin,
 						// The Zod extension must bundle the real package, while all other
 						// workers import that single shared copy.
 						...(args.path === miniflareZodExtensionPath

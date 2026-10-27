@@ -1,5 +1,4 @@
 import assert from "node:assert";
-import { XMLValidator } from "fast-xml-parser";
 import { CorePaths } from "../../core/constants";
 import { R2S3Bindings } from "../constants";
 import { parseRangeHeader, serveR2Object } from "../serve.worker";
@@ -7,6 +6,7 @@ import { awsUriEncode, credentialsEqual } from "./auth.worker";
 import {
 	coerceArray,
 	hex,
+	isWellFormedXml,
 	MAX_DELETE_KEYS,
 	MAX_LIST_KEYS,
 	xmlParser,
@@ -858,7 +858,7 @@ export const MULTIPART_OPERATIONS: Record<
 		unsupportedHeaders: BUCKET_OWNER,
 		async handle({ c, bucket, bucketId, key, uploadId }) {
 			const text = await c.req.raw.text();
-			if (XMLValidator.validate(text) !== true) {
+			if (!isWellFormedXml(text)) {
 				return malformedXml();
 			}
 
@@ -1034,7 +1034,7 @@ export const BUCKET_OPERATIONS: Record<
 			}
 
 			const text = new TextDecoder().decode(body);
-			if (XMLValidator.validate(text) !== true) {
+			if (!isWellFormedXml(text)) {
 				return malformedXml();
 			}
 
